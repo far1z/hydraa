@@ -5,10 +5,11 @@
  * on the Akash decentralised cloud.  The lifecycle is:
  *
  *   1. Generate SDL from {@link DeploymentConfig}
- *   2. Broadcast a `MsgCreateDeployment` transaction
- *   3. Wait for provider bids, select the cheapest
- *   4. Create a lease with the winning bidder
- *   5. Monitor via the Akash provider REST API
+ *   2. Parse SDL with akashjs SDL class for proper groups/version
+ *   3. Broadcast a `MsgCreateDeployment` transaction
+ *   4. Wait for provider bids, select the cheapest
+ *   5. Create a lease with the winning bidder
+ *   6. Monitor via the Akash provider REST API
  */
 
 import { createRequire } from 'node:module';
@@ -28,37 +29,45 @@ import { AkashWallet } from './wallet.js';
 import { AkashMonitor } from './monitor.js';
 import { generateSDL } from './sdl.js';
 
+const require = createRequire(import.meta.url);
+
 /**
- * Load the Akash protobuf type registry so cosmjs can serialize Akash messages.
- * Side-effect imports of @akashnetwork/akash-api populate a global messageTypeRegistry.
- * We then register each type with a cosmjs Registry for proper encoding.
+ * Load the Akash protobuf type registry and SDL class.
+ * Uses akashjs built-in helpers for proper type registration.
  */
-function loadAkashRegistry(): { registry: Registry; types: Map<string, any> } {
-  const require = createRequire(import.meta.url);
+function loadAkash(): { registry: Registry; types: [string, any][]; SDLClass: any } {
+  // Side-effect imports populate the global messageTypeRegistry
   require('@akashnetwork/akash-api/v1beta3');
   require('@akashnetwork/akash-api/v1beta4');
-  const { messageTypeRegistry } = require('@akashnetwork/akash-api/typeRegistry');
+
+  const { getAkashTypeRegistry } = require('@akashnetwork/akashjs/build/stargate');
+  const { SDL } = require('@akashnetwork/akashjs/build/sdl');
+  const types: [string, any][] = getAkashTypeRegistry();
 
   const registry = new Registry(defaultRegistryTypes);
-  for (const [typeName, typeImpl] of messageTypeRegistry) {
-    registry.register(`/${typeName}`, typeImpl as any);
+  for (const [typeUrl, type] of types) {
+    registry.register(typeUrl, type as any);
   }
-  return { registry, types: messageTypeRegistry };
+
+  return { registry, types, SDLClass: SDL };
 }
 
 /** Cached instances. */
-let _loaded: { registry: Registry; types: Map<string, any> } | null = null;
+let _loaded: { registry: Registry; types: [string, any][]; SDLClass: any } | null = null;
 function getLoaded() {
-  if (!_loaded) _loaded = loadAkashRegistry();
+  if (!_loaded) _loaded = loadAkash();
   return _loaded;
 }
 function getRegistry(): Registry {
   return getLoaded().registry;
 }
-function getAkashType(name: string): any {
-  const type = getLoaded().types.get(name);
-  if (!type) throw new Error(`Unknown Akash type: ${name}`);
-  return type;
+function getAkashType(typeUrl: string): any {
+  const entry = getLoaded().types.find(([url]) => url === typeUrl);
+  if (!entry) throw new Error(`Unknown Akash type: ${typeUrl}`);
+  return entry[1];
+}
+function getSDLClass(): any {
+  return getLoaded().SDLClass;
 }
 
 /** How long (ms) to wait for bids after creating a deployment. */
@@ -86,12 +95,18 @@ export class AkashProvider implements ComputeProvider {
   // -----------------------------------------------------------------------
 
   async deploy(config: DeploymentConfig): Promise<Deployment> {
-    const sdl = generateSDL(config);
+    const sdlYaml = generateSDL(config);
     const address = await this.wallet.getAddress();
 
-    // 1. Create deployment on-chain
+    // Parse SDL with akashjs for proper groups and version hash
+    const SDL = getSDLClass();
+    const sdl = SDL.fromString(sdlYaml, 'beta3');
+    const groups = sdl.groups();
+    const version: Uint8Array = await sdl.manifestVersion();
+
+    // 1. Create deployment on-chain using SDL-generated groups
     const dseq = Long.fromNumber(Date.now());
-    const createMsg = buildCreateDeploymentMsg(address, dseq, sdl);
+    const createMsg = buildCreateDeploymentMsg(address, dseq, groups, version);
 
     const txHash = await this.wallet.signAndBroadcast(
       [createMsg],
@@ -108,7 +123,7 @@ export class AkashProvider implements ComputeProvider {
       metadata: {
         dseq: dseqStr,
         txHash,
-        sdl,
+        sdl: sdlYaml,
         owner: address,
       },
     };
@@ -142,7 +157,7 @@ export class AkashProvider implements ComputeProvider {
     deployment.metadata['oseq'] = String(bid.oseq);
 
     // 4. Send the manifest to the provider
-    await this.sendManifest(bid.providerUri ?? '', dseqStr, sdl);
+    await this.sendManifest(bid.providerUri ?? '', dseqStr, sdlYaml);
 
     deployment.status = 'running';
     return deployment;
@@ -286,7 +301,7 @@ export class AkashProvider implements ComputeProvider {
   }
 
   /**
-   * POST the deployment manifest (SDL) to the winning provider so it can
+   * PUT the deployment manifest (SDL) to the winning provider so it can
    * pull the container image and start the workload.
    */
   private async sendManifest(
@@ -311,7 +326,7 @@ export class AkashProvider implements ComputeProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Message builders — use fromPartial for proper protobuf encoding
+// Message builders — use SDL-generated groups and fromPartial for encoding
 // ---------------------------------------------------------------------------
 
 interface Bid {
@@ -322,15 +337,18 @@ interface Bid {
   providerUri?: string;
 }
 
-function buildCreateDeploymentMsg(owner: string, dseq: Long, sdl: string) {
-  const { sha256 } = require('@noble/hashes/sha256') as typeof import('@noble/hashes/sha256');
-  const version = sha256(new TextEncoder().encode(sdl));
-  const MsgCreateDeployment = getAkashType('akash.deployment.v1beta3.MsgCreateDeployment');
+function buildCreateDeploymentMsg(
+  owner: string,
+  dseq: Long,
+  groups: any[],
+  version: Uint8Array,
+) {
+  const MsgCreateDeployment = getAkashType('/akash.deployment.v1beta3.MsgCreateDeployment');
   return {
     typeUrl: '/akash.deployment.v1beta3.MsgCreateDeployment',
     value: MsgCreateDeployment.fromPartial({
       id: { owner, dseq },
-      groups: [],
+      groups,
       version,
       depositor: owner,
       deposit: { denom: 'uakt', amount: '5000000' },
@@ -345,7 +363,7 @@ function buildCreateLeaseMsg(
   gseq: number,
   oseq: number,
 ) {
-  const MsgCreateLease = getAkashType('akash.market.v1beta4.MsgCreateLease');
+  const MsgCreateLease = getAkashType('/akash.market.v1beta4.MsgCreateLease');
   return {
     typeUrl: '/akash.market.v1beta4.MsgCreateLease',
     value: MsgCreateLease.fromPartial({
@@ -361,7 +379,7 @@ function buildCloseLeaseMsg(
   gseq: number,
   oseq: number,
 ) {
-  const MsgCloseLease = getAkashType('akash.market.v1beta4.MsgCloseLease');
+  const MsgCloseLease = getAkashType('/akash.market.v1beta4.MsgCloseLease');
   return {
     typeUrl: '/akash.market.v1beta4.MsgCloseLease',
     value: MsgCloseLease.fromPartial({
@@ -371,7 +389,7 @@ function buildCloseLeaseMsg(
 }
 
 function buildCloseDeploymentMsg(owner: string, dseq: Long) {
-  const MsgCloseDeployment = getAkashType('akash.deployment.v1beta3.MsgCloseDeployment');
+  const MsgCloseDeployment = getAkashType('/akash.deployment.v1beta3.MsgCloseDeployment');
   return {
     typeUrl: '/akash.deployment.v1beta3.MsgCloseDeployment',
     value: MsgCloseDeployment.fromPartial({

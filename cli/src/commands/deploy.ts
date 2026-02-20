@@ -1,39 +1,22 @@
+import { createRequire } from "node:module";
 import { Command } from "commander";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { SigningStargateClient, StargateClient } from "@cosmjs/stargate";
 import Long from "long";
-import { sha256 } from "@noble/hashes/sha256";
 import {
   requireConfig,
   saveConfig,
   DEFAULT_RPC,
-  DEFAULT_CHAIN_ID,
 } from "../utils/config.js";
 import { getAkashRegistry, getAkashType } from "../utils/akash-registry.js";
 import { banner, success, error, warn, info, createSpinner, formatAKT } from "../utils/display.js";
+
+const require = createRequire(import.meta.url);
 
 /** How long (ms) to wait for bids after creating a deployment. */
 const BID_TIMEOUT_MS = 120_000;
 /** Polling interval while waiting for bids. */
 const BID_POLL_MS = 5_000;
-
-/** Hash SDL content to produce the deployment version (32-byte sha256). */
-function hashSDL(sdl: string): Uint8Array {
-  return sha256(new TextEncoder().encode(sdl));
-}
-
-/** Parse memory string like "512Mi" to bytes. */
-function parseMemoryBytes(mem: string): number {
-  const match = mem.match(/^(\d+)(Ki|Mi|Gi)?$/);
-  if (!match) return 536870912;
-  const val = parseInt(match[1], 10);
-  switch (match[2]) {
-    case "Ki": return val * 1024;
-    case "Mi": return val * 1024 * 1024;
-    case "Gi": return val * 1024 * 1024 * 1024;
-    default: return val;
-  }
-}
 
 export const deployCommand = new Command("deploy")
   .description("Deploy your agent to decentralized compute")
@@ -68,13 +51,12 @@ export const deployCommand = new Command("deploy")
     const image = "ghcr.io/openclaw/hydraa-runtime:latest";
     const nostrRelays = (config.nostr?.relays ?? ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]).join(",");
 
-    // Build SDL for manifest upload and version hash
-    const sdl = buildSDL({ cpu, memory, storage, image, nostrRelays });
-    const sdlVersion = hashSDL(sdl);
+    // Build SDL YAML
+    const sdlYaml = buildSDL({ cpu, memory, storage, image, nostrRelays });
 
     if (opts.dryRun) {
       info("Dry run — Akash SDL manifest:\n");
-      console.log(sdl);
+      console.log(sdlYaml);
       return;
     }
 
@@ -82,15 +64,26 @@ export const deployCommand = new Command("deploy")
     info(`RPC:      ${rpc}`);
     console.log();
 
-    // Step 0: Load Akash protobuf types
-    const regSpinner = createSpinner("Loading Akash protobuf types...");
+    // Step 0: Parse SDL with akashjs SDL class and load registry
+    const regSpinner = createSpinner("Loading Akash types and parsing SDL...");
     regSpinner.start();
+
     let registry;
+    let sdl: any;
+    let groups: any[];
+    let version: Uint8Array;
     try {
       registry = getAkashRegistry();
-      regSpinner.succeed("Akash types registered");
+
+      // Use akashjs SDL class for proper group/version generation
+      const { SDL } = require("@akashnetwork/akashjs/build/sdl");
+      sdl = SDL.fromString(sdlYaml, "beta3");
+      groups = sdl.groups();
+      version = await sdl.manifestVersion();
+
+      regSpinner.succeed("Akash types registered, SDL parsed");
     } catch (err) {
-      regSpinner.fail("Failed to load Akash types");
+      regSpinner.fail("Failed to load Akash types or parse SDL");
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
@@ -133,7 +126,7 @@ export const deployCommand = new Command("deploy")
       balSpinner.warn("Could not check balance (RPC error). Proceeding anyway...");
     }
 
-    // Step 2: Create deployment with proper protobuf encoding
+    // Step 2: Create deployment using SDL-generated groups and version
     const deploySpinner = createSpinner("Creating Akash deployment...");
     deploySpinner.start();
 
@@ -147,38 +140,13 @@ export const deployCommand = new Command("deploy")
     }
 
     const dseq = Long.fromNumber(Date.now());
-    const cpuMilliunits = Math.round(cpu * 1000);
-    const memBytes = parseMemoryBytes(memory);
-    const storBytes = parseMemoryBytes(storage);
 
-    // Build message using protobuf fromPartial for correct encoding
+    // Build MsgCreateDeployment with SDL-generated groups and version hash
     const MsgCreateDeployment = getAkashType("/akash.deployment.v1beta3.MsgCreateDeployment");
     const deployMsgValue = MsgCreateDeployment.fromPartial({
       id: { owner: address, dseq },
-      groups: [
-        {
-          name: "dcloud",
-          requirements: {
-            signedBy: { allOf: [], anyOf: [] },
-            attributes: [],
-          },
-          resources: [
-            {
-              resource: {
-                id: 1,
-                cpu: { units: { val: String(cpuMilliunits) }, attributes: [] },
-                memory: { quantity: { val: String(memBytes) }, attributes: [] },
-                storage: [{ name: "default", quantity: { val: String(storBytes) }, attributes: [] }],
-                gpu: { units: { val: "0" }, attributes: [] },
-                endpoints: [],
-              },
-              count: 1,
-              price: { denom: "uakt", amount: "10000" },
-            },
-          ],
-        },
-      ],
-      version: sdlVersion,
+      groups,
+      version,
       deposit: { denom: "uakt", amount: "5000000" },
       depositor: address,
     });
@@ -258,7 +226,7 @@ export const deployCommand = new Command("deploy")
       process.exit(1);
     }
 
-    // Step 4: Create lease using proper protobuf encoding
+    // Step 4: Create lease
     const leaseSpinner = createSpinner("Accepting best bid and creating lease...");
     leaseSpinner.start();
 
@@ -315,7 +283,7 @@ export const deployCommand = new Command("deploy")
         const manifestRes = await fetch(manifestUrl, {
           method: "PUT",
           headers: { "Content-Type": "application/yaml" },
-          body: sdl,
+          body: sdlYaml,
           signal: AbortSignal.timeout(15_000),
         });
         if (!manifestRes.ok) {
@@ -379,11 +347,10 @@ version: "2.0"
 services:
   agent:
     image: ${opts.image}
+    expose: []
     env:
       - HYDRAA_MODE=production
       - NOSTR_RELAYS=${opts.nostrRelays}
-    params:
-      {}
 profiles:
   compute:
     agent:

@@ -35,7 +35,7 @@ export function generateSDL(config: DeploymentConfig): string {
     .join('\n');
 
   // --- Exposed port block -----------------------------------------------
-  let exposeBlock = '';
+  let exposeBlock = '    expose: []\n';
   if (ports.length > 0) {
     const portEntries = ports
       .map(
