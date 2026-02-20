@@ -1,38 +1,12 @@
 import { Command } from "commander";
-import { readFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { parse as parseYaml } from "yaml";
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { StargateClient } from "@cosmjs/stargate";
+import {
+  requireConfig,
+  DEFAULT_RPC,
+  MONTHLY_COST_ESTIMATE,
+} from "../utils/config.js";
 import { banner, info, warn, success, error, formatAKT, table, createSpinner } from "../utils/display.js";
-
-const DEFAULT_RPC = "https://rpc.akashnet.net:443";
-const MONTHLY_COST_ESTIMATE = 3.5; // AKT
-
-interface HydraaConfig {
-  akash?: {
-    mnemonic?: string;
-    address?: string;
-    rpc?: string;
-  };
-}
-
-/** Find and parse the Hydraa config.yaml */
-function loadConfig(): HydraaConfig | null {
-  const paths = [
-    join(homedir(), ".openclaw", "skills", "hydraa", "config.yaml"),
-    join(process.cwd(), ".openclaw", "skills", "hydraa", "config.yaml"),
-  ];
-
-  for (const p of paths) {
-    if (existsSync(p)) {
-      const raw = readFileSync(p, "utf-8");
-      return parseYaml(raw) as HydraaConfig;
-    }
-  }
-  return null;
-}
 
 /** Derive wallet address from mnemonic */
 async function getWalletAddress(mnemonic: string): Promise<string> {
@@ -60,9 +34,9 @@ export const fundCommand = new Command("fund")
   .action(async () => {
     banner();
 
-    // Load config
-    const config = loadConfig();
-    if (!config?.akash?.mnemonic) {
+    const config = requireConfig();
+
+    if (!config.akash?.mnemonic) {
       error("No AKT wallet found. Run 'hydraa init' first to generate one.");
       process.exit(1);
     }

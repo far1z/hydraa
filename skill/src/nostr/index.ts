@@ -9,3 +9,4 @@ export * from './encryption.js';
 export * from './client.js';
 export * from './memory.js';
 export * from './channel.js';
+export * from './listener.js';
