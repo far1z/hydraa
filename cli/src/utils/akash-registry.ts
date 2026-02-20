@@ -1,54 +1,39 @@
 /**
  * Akash protobuf type registry for cosmjs.
  *
- * Loads all Akash message types from @akashnetwork/akash-api and registers
- * them with a cosmjs Registry so SigningStargateClient can encode/decode them.
- *
- * The key trick: importing the v1beta3/v1beta4 barrel modules triggers
- * side-effect registration into a shared messageTypeRegistry Map. We then
- * read from that Map and feed the types into a cosmjs Registry.
+ * Uses @akashnetwork/akashjs's built-in getAkashTypeRegistry() which returns
+ * all Akash message types pre-registered. We merge them into a cosmjs Registry
+ * alongside the default Cosmos SDK types.
  */
 
 import { createRequire } from "node:module";
 import { Registry } from "@cosmjs/proto-signing";
 import { defaultRegistryTypes } from "@cosmjs/stargate";
 
-export interface AkashMessageType {
-  $type: string;
-  encode: (message: any, writer?: any) => any;
-  decode: (input: any, length?: number) => any;
-  fromPartial: (object: any) => any;
-  fromJSON: (object: any) => any;
-  toJSON: (message: any) => any;
-}
-
+/** Cached registry and types. */
 let _registry: Registry | null = null;
-let _messageTypes: Map<string, AkashMessageType> | null = null;
+let _akashTypes: [string, any][] | null = null;
 
 /**
- * Load all Akash protobuf types and create a cosmjs Registry.
- * Cached after first call.
+ * Build a cosmjs Registry containing both default Cosmos SDK types
+ * and all Akash Network message types. Cached after first call.
  */
 export function getAkashRegistry(): Registry {
   if (_registry) return _registry;
 
   const require = createRequire(import.meta.url);
 
-  // Side-effect imports: populate the global messageTypeRegistry
+  // Side-effect imports populate the shared messageTypeRegistry
   require("@akashnetwork/akash-api/v1beta3");
   require("@akashnetwork/akash-api/v1beta4");
 
-  const { messageTypeRegistry } = require("@akashnetwork/akash-api/typeRegistry");
-  _messageTypes = messageTypeRegistry;
+  // Use akashjs's built-in helper to get all registered types
+  const { getAkashTypeRegistry } = require("@akashnetwork/akashjs/build/stargate");
+  _akashTypes = getAkashTypeRegistry();
 
-  // Build cosmjs registry with default + all Akash types
   const registry = new Registry(defaultRegistryTypes);
-
-  for (const [typeName, typeImpl] of messageTypeRegistry) {
-    const typeUrl = `/${typeName}`;
-    // cosmjs Registry.register expects (typeUrl, GeneratedType)
-    // GeneratedType needs encode/decode/fromPartial — which our types have
-    registry.register(typeUrl, typeImpl as any);
+  for (const [typeUrl, type] of _akashTypes!) {
+    registry.register(typeUrl, type as any);
   }
 
   _registry = registry;
@@ -56,19 +41,12 @@ export function getAkashRegistry(): Registry {
 }
 
 /**
- * Get a specific Akash protobuf message type by its $type name.
- * Call getAkashRegistry() first to ensure types are loaded.
- *
- * @example
- * ```ts
- * getAkashRegistry(); // ensure loaded
- * const MsgCreateDeployment = getAkashType("akash.deployment.v1beta3.MsgCreateDeployment");
- * const msg = MsgCreateDeployment.fromPartial({ ... });
- * ```
+ * Get a specific Akash protobuf type by typeUrl (e.g. "/akash.deployment.v1beta3.MsgCreateDeployment").
+ * The returned type has fromPartial(), encode(), and decode() methods.
  */
-export function getAkashType(typeName: string): AkashMessageType {
-  if (!_messageTypes) getAkashRegistry();
-  const type = _messageTypes!.get(typeName);
-  if (!type) throw new Error(`Unknown Akash type: ${typeName}`);
-  return type;
+export function getAkashType(typeUrl: string): any {
+  if (!_akashTypes) getAkashRegistry();
+  const entry = _akashTypes!.find(([url]) => url === typeUrl);
+  if (!entry) throw new Error(`Unknown Akash type: ${typeUrl}`);
+  return entry[1];
 }

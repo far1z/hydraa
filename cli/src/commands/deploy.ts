@@ -152,7 +152,7 @@ export const deployCommand = new Command("deploy")
     const storBytes = parseMemoryBytes(storage);
 
     // Build message using protobuf fromPartial for correct encoding
-    const MsgCreateDeployment = getAkashType("akash.deployment.v1beta3.MsgCreateDeployment");
+    const MsgCreateDeployment = getAkashType("/akash.deployment.v1beta3.MsgCreateDeployment");
     const deployMsgValue = MsgCreateDeployment.fromPartial({
       id: { owner: address, dseq },
       groups: [
@@ -262,7 +262,7 @@ export const deployCommand = new Command("deploy")
     const leaseSpinner = createSpinner("Accepting best bid and creating lease...");
     leaseSpinner.start();
 
-    const MsgCreateLease = getAkashType("akash.market.v1beta4.MsgCreateLease");
+    const MsgCreateLease = getAkashType("/akash.market.v1beta4.MsgCreateLease");
     const leaseMsgValue = MsgCreateLease.fromPartial({
       bidId: {
         owner: address,
