@@ -1,0 +1,58 @@
+{
+  "name": "hydraa",
+  "version": "0.1.0",
+  "description": "Make your OpenClaw agent unstoppable. Decentralized compute, messaging, memory, and identity.",
+  "type": "module",
+  "main": "dist/skill/src/index.js",
+  "bin": {
+    "hydraa": "dist/cli/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "lint": "eslint skill/ cli/",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "openclaw",
+    "decentralized",
+    "akash",
+    "nostr",
+    "agent",
+    "unkillable"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "nostr-tools": "^2.10.4",
+    "@noble/hashes": "^1.6.1",
+    "@noble/secp256k1": "^2.1.0",
+    "@akashnetwork/akashjs": "^0.10.0",
+    "@cosmjs/stargate": "^0.32.4",
+    "@cosmjs/proto-signing": "^0.32.4",
+    "@cosmjs/crypto": "^0.32.4",
+    "better-sqlite3": "^11.7.0",
+    "commander": "^12.1.0",
+    "ws": "^8.18.0",
+    "cron": "^3.2.1",
+    "chalk": "^5.4.1",
+    "ora": "^8.1.1",
+    "yaml": "^2.6.1",
+    "dockerode": "^4.0.4",
+    "ssh2": "^1.16.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/ws": "^8.5.13",
+    "@types/dockerode": "^3.3.33",
+    "@types/ssh2": "^1.15.4",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8",
+    "eslint": "^9.15.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
