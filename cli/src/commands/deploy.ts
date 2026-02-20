@@ -1,15 +1,36 @@
 import { Command } from "commander";
-import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
-import { SigningStargateClient } from "@cosmjs/stargate";
-import { StargateClient } from "@cosmjs/stargate";
+import { createRequire } from "node:module";
+import { DirectSecp256k1HdWallet, Registry } from "@cosmjs/proto-signing";
+import { SigningStargateClient, StargateClient, defaultRegistryTypes } from "@cosmjs/stargate";
+import Long from "long";
 import {
   requireConfig,
   saveConfig,
   DEFAULT_RPC,
   DEFAULT_CHAIN_ID,
-  type HydraaConfig,
 } from "../utils/config.js";
 import { banner, success, error, warn, info, createSpinner, formatAKT } from "../utils/display.js";
+
+/**
+ * Load the Akash protobuf type registry.
+ *
+ * The @akashnetwork/akash-api package uses side-effect imports — importing the
+ * barrel modules populates a global messageTypeRegistry that getAkashTypeRegistry
+ * then reads from. We use createRequire because the packages are CJS.
+ */
+function loadAkashRegistry(): Registry {
+  const require = createRequire(import.meta.url);
+
+  // Side-effect imports: populates the shared messageTypeRegistry
+  require("@akashnetwork/akash-api/v1beta3");
+  require("@akashnetwork/akash-api/v1beta4");
+
+  const { getAkashTypeRegistry } = require("@akashnetwork/akashjs/build/stargate");
+  const akashTypes = getAkashTypeRegistry();
+
+  const registry = new Registry([...defaultRegistryTypes, ...akashTypes]);
+  return registry;
+}
 
 /** How long (ms) to wait for bids after creating a deployment. */
 const BID_TIMEOUT_MS = 120_000;
@@ -64,6 +85,19 @@ export const deployCommand = new Command("deploy")
     info(`Chain:    ${chainId}`);
     console.log();
 
+    // Step 0: Load Akash type registry
+    const regSpinner = createSpinner("Loading Akash protobuf types...");
+    regSpinner.start();
+    let registry: Registry;
+    try {
+      registry = loadAkashRegistry();
+      regSpinner.succeed("Akash types loaded");
+    } catch (err) {
+      regSpinner.fail("Failed to load Akash type registry");
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+
     // Step 1: Load wallet and check balance
     const walletSpinner = createSpinner("Loading wallet...");
     walletSpinner.start();
@@ -98,31 +132,53 @@ export const deployCommand = new Command("deploy")
           process.exit(1);
         }
       }
-    } catch (err) {
+    } catch {
       balSpinner.warn("Could not check balance (RPC error). Proceeding anyway...");
     }
 
-    // Step 2: Create deployment transaction
+    // Step 2: Create deployment transaction with Akash registry
     const deploySpinner = createSpinner("Creating Akash deployment...");
     deploySpinner.start();
 
     let signingClient: SigningStargateClient;
     try {
-      signingClient = await SigningStargateClient.connectWithSigner(rpc, wallet);
+      signingClient = await SigningStargateClient.connectWithSigner(rpc, wallet, {
+        registry,
+      });
     } catch (err) {
       deploySpinner.fail("Failed to connect to Akash RPC");
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
 
-    const dseq = Date.now().toString();
+    const dseq = Long.fromNumber(Date.now());
     const createMsg = {
       typeUrl: "/akash.deployment.v1beta3.MsgCreateDeployment",
       value: {
         id: { owner: address, dseq },
+        groups: [
+          {
+            name: "dcloud",
+            requirements: { signedBy: { allOf: [], anyOf: [] }, attributes: [] },
+            resources: [
+              {
+                resource: {
+                  id: 1,
+                  cpu: { units: { val: new Uint8Array(Buffer.from(String(cpu * 1000))) } },
+                  memory: { quantity: { val: new Uint8Array(Buffer.from(String(parseMemoryBytes(memory)))) } },
+                  storage: [{ name: "default", quantity: { val: new Uint8Array(Buffer.from(String(parseStorageBytes(storage)))) } }],
+                  gpu: { units: { val: new Uint8Array(Buffer.from("0")) } },
+                  endpoints: [],
+                },
+                count: 1,
+                price: { denom: "uakt", amount: "10000" },
+              },
+            ],
+          },
+        ],
         version: new Uint8Array(32),
-        depositor: address,
         deposit: { denom: "uakt", amount: "5000000" },
+        depositor: address,
       },
     };
 
@@ -151,12 +207,12 @@ export const deployCommand = new Command("deploy")
     const bidSpinner = createSpinner("Waiting for provider bids...");
     bidSpinner.start();
 
-    let bestBid: { provider: string; gseq: string; oseq: string; price: number } | null = null;
+    let bestBid: { provider: string; gseq: number; oseq: number; price: number } | null = null;
     const deadline = Date.now() + BID_TIMEOUT_MS;
 
     while (Date.now() < deadline) {
       try {
-        const bidsUrl = `${rpc}/akash/market/v1beta4/bids/list?filters.owner=${address}&filters.dseq=${dseq}`;
+        const bidsUrl = `${rpc}/akash/market/v1beta4/bids/list?filters.owner=${address}&filters.dseq=${dseq.toString()}`;
         const res = await fetch(bidsUrl, { signal: AbortSignal.timeout(10_000) });
 
         if (res.ok) {
@@ -165,8 +221,8 @@ export const deployCommand = new Command("deploy")
             .filter((b: any) => b.bid?.state === "open")
             .map((b: any) => ({
               provider: b.bid.bid_id?.provider ?? "",
-              gseq: b.bid.bid_id?.gseq ?? "1",
-              oseq: b.bid.bid_id?.oseq ?? "1",
+              gseq: parseInt(b.bid.bid_id?.gseq ?? "1", 10),
+              oseq: parseInt(b.bid.bid_id?.oseq ?? "1", 10),
               price: parseInt(b.bid.price?.amount ?? "0", 10),
             }));
 
@@ -196,14 +252,14 @@ export const deployCommand = new Command("deploy")
       process.exit(1);
     }
 
-    // Step 4: Create lease (accept bid)
+    // Step 4: Create lease (accept bid) — use proper protobuf types
     const leaseSpinner = createSpinner("Accepting best bid and creating lease...");
     leaseSpinner.start();
 
     const leaseMsg = {
       typeUrl: "/akash.market.v1beta4.MsgCreateLease",
       value: {
-        bid_id: {
+        bidId: {
           owner: address,
           dseq,
           gseq: bestBid.gseq,
@@ -251,7 +307,7 @@ export const deployCommand = new Command("deploy")
 
     if (providerUri) {
       try {
-        const manifestUrl = `${providerUri}/deployment/${dseq}/manifest`;
+        const manifestUrl = `${providerUri}/deployment/${dseq.toString()}/manifest`;
         const manifestRes = await fetch(manifestUrl, {
           method: "PUT",
           headers: { "Content-Type": "application/yaml" },
@@ -263,7 +319,7 @@ export const deployCommand = new Command("deploy")
         } else {
           manifestSpinner.succeed("Manifest sent to provider");
         }
-      } catch (err) {
+      } catch {
         manifestSpinner.warn("Could not reach provider API. Deployment may still start automatically.");
       }
     } else {
@@ -273,15 +329,16 @@ export const deployCommand = new Command("deploy")
     signingClient.disconnect();
 
     // Save deployment state to config
+    const dseqStr = dseq.toString();
     try {
       config._state = config._state ?? {};
       config._state.deployment = {
-        id: `${address}/${dseq}`,
-        dseq,
+        id: `${address}/${dseqStr}`,
+        dseq: dseqStr,
         provider_address: bestBid.provider,
         provider_uri: providerUri,
-        gseq: bestBid.gseq,
-        oseq: bestBid.oseq,
+        gseq: String(bestBid.gseq),
+        oseq: String(bestBid.oseq),
         status: "running",
         deployed_at: new Date().toISOString(),
       };
@@ -294,8 +351,8 @@ export const deployCommand = new Command("deploy")
     console.log();
     console.log("  Deployment Details:");
     console.log("  ─────────────────────────────────────────────");
-    info(`Deployment ID:    ${address.slice(0, 12)}.../${dseq}`);
-    info(`DSEQ:             ${dseq}`);
+    info(`Deployment ID:    ${address.slice(0, 12)}.../${dseqStr}`);
+    info(`DSEQ:             ${dseqStr}`);
     info(`Provider:         ${bestBid.provider.slice(0, 30)}...`);
     info(`Lease TX:         ${leaseTxHash.slice(0, 16)}...`);
     info(`Status:           active`);
@@ -345,4 +402,22 @@ deployment:
       profile: agent
       count: 1
 `;
+}
+
+/** Parse memory string like "512Mi" to bytes. */
+function parseMemoryBytes(mem: string): number {
+  const match = mem.match(/^(\d+)(Mi|Gi|Ki)?$/);
+  if (!match) return 536870912; // 512Mi default
+  const val = parseInt(match[1], 10);
+  switch (match[2]) {
+    case "Ki": return val * 1024;
+    case "Mi": return val * 1024 * 1024;
+    case "Gi": return val * 1024 * 1024 * 1024;
+    default: return val;
+  }
+}
+
+/** Parse storage string like "1Gi" to bytes. */
+function parseStorageBytes(stor: string): number {
+  return parseMemoryBytes(stor);
 }

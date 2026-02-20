@@ -11,6 +11,10 @@
  *   5. Monitor via the Akash provider REST API
  */
 
+import { createRequire } from 'node:module';
+import { Registry } from '@cosmjs/proto-signing';
+import { defaultRegistryTypes } from '@cosmjs/stargate';
+import Long from 'long';
 import type {
   ComputeProvider,
   Deployment,
@@ -23,6 +27,25 @@ import type {
 import { AkashWallet } from './wallet.js';
 import { AkashMonitor } from './monitor.js';
 import { generateSDL } from './sdl.js';
+
+/**
+ * Load the Akash protobuf type registry so cosmjs can serialize Akash messages.
+ * Side-effect imports of @akashnetwork/akash-api populate a global registry.
+ */
+function loadAkashRegistry(): Registry {
+  const require = createRequire(import.meta.url);
+  require('@akashnetwork/akash-api/v1beta3');
+  require('@akashnetwork/akash-api/v1beta4');
+  const { getAkashTypeRegistry } = require('@akashnetwork/akashjs/build/stargate');
+  return new Registry([...defaultRegistryTypes, ...getAkashTypeRegistry()]);
+}
+
+/** Cached registry instance. */
+let _registry: Registry | null = null;
+function getRegistry(): Registry {
+  if (!_registry) _registry = loadAkashRegistry();
+  return _registry;
+}
 
 /** How long (ms) to wait for bids after creating a deployment. */
 const BID_WAIT_MS = 30_000;
@@ -40,7 +63,7 @@ export class AkashProvider implements ComputeProvider {
   constructor(rpcEndpoint: string, mnemonic: string, chainId = 'akashnet-2') {
     this.rpcEndpoint = rpcEndpoint;
     this.chainId = chainId;
-    this.wallet = new AkashWallet(mnemonic, rpcEndpoint);
+    this.wallet = new AkashWallet(mnemonic, rpcEndpoint, getRegistry());
     this.monitor = new AkashMonitor(rpcEndpoint);
   }
 
@@ -53,7 +76,7 @@ export class AkashProvider implements ComputeProvider {
     const address = await this.wallet.getAddress();
 
     // 1. Create deployment on-chain
-    const dseq = Date.now().toString(); // Simple unique dseq
+    const dseq = Long.fromNumber(Date.now());
     const createMsg = buildCreateDeploymentMsg(address, dseq, sdl);
 
     const txHash = await this.wallet.signAndBroadcast(
@@ -61,14 +84,15 @@ export class AkashProvider implements ComputeProvider {
       defaultFee(),
     );
 
+    const dseqStr = dseq.toString();
     const deployment: Deployment = {
-      id: `${address}/${dseq}`,
+      id: `${address}/${dseqStr}`,
       provider: this.name,
       status: 'deploying',
       createdAt: new Date(),
       config,
       metadata: {
-        dseq,
+        dseq: dseqStr,
         txHash,
         sdl,
         owner: address,
@@ -76,7 +100,7 @@ export class AkashProvider implements ComputeProvider {
     };
 
     // 2. Wait for bids and pick the cheapest
-    const bid = await this.waitForBids(address, dseq);
+    const bid = await this.waitForBids(address, dseqStr);
     if (!bid) {
       deployment.status = 'failed';
       deployment.metadata['error'] = 'No bids received within timeout';
@@ -100,11 +124,11 @@ export class AkashProvider implements ComputeProvider {
     deployment.metadata['leaseTxHash'] = leaseTxHash;
     deployment.metadata['providerAddress'] = bid.provider;
     deployment.metadata['providerUri'] = bid.providerUri ?? '';
-    deployment.metadata['gseq'] = bid.gseq;
-    deployment.metadata['oseq'] = bid.oseq;
+    deployment.metadata['gseq'] = String(bid.gseq);
+    deployment.metadata['oseq'] = String(bid.oseq);
 
     // 4. Send the manifest to the provider
-    await this.sendManifest(bid.providerUri ?? '', dseq, sdl);
+    await this.sendManifest(bid.providerUri ?? '', dseqStr, sdl);
 
     deployment.status = 'running';
     return deployment;
@@ -130,13 +154,14 @@ export class AkashProvider implements ComputeProvider {
 
   async destroy(deployment: Deployment): Promise<void> {
     const address = await this.wallet.getAddress();
-    const dseq = deployment.metadata['dseq'];
-    if (!dseq) throw new Error('Missing dseq in deployment metadata');
+    const dseqStr = deployment.metadata['dseq'];
+    if (!dseqStr) throw new Error('Missing dseq in deployment metadata');
+    const dseq = Long.fromString(dseqStr);
 
     // Close the lease first, then the deployment.
     const providerAddress = deployment.metadata['providerAddress'];
-    const gseq = deployment.metadata['gseq'] ?? '1';
-    const oseq = deployment.metadata['oseq'] ?? '1';
+    const gseq = parseInt(deployment.metadata['gseq'] ?? '1', 10);
+    const oseq = parseInt(deployment.metadata['oseq'] ?? '1', 10);
 
     if (providerAddress) {
       const closeLeaseMsg = buildCloseLeaseMsg(
@@ -236,8 +261,8 @@ export class AkashProvider implements ComputeProvider {
         .filter((b) => b.bid?.state === 'open')
         .map((b) => ({
           provider: b.bid!.bid_id!.provider ?? '',
-          gseq: b.bid!.bid_id!.gseq ?? '1',
-          oseq: b.bid!.bid_id!.oseq ?? '1',
+          gseq: parseInt(b.bid!.bid_id!.gseq ?? '1', 10),
+          oseq: parseInt(b.bid!.bid_id!.oseq ?? '1', 10),
           price: parseInt(b.bid!.price?.amount ?? '0', 10),
           providerUri: undefined as string | undefined,
         }));
@@ -281,17 +306,18 @@ export class AkashProvider implements ComputeProvider {
 
 interface Bid {
   provider: string;
-  gseq: string;
-  oseq: string;
+  gseq: number;
+  oseq: number;
   price: number;
   providerUri?: string;
 }
 
-function buildCreateDeploymentMsg(owner: string, dseq: string, _sdl: string) {
+function buildCreateDeploymentMsg(owner: string, dseq: Long, _sdl: string) {
   return {
     typeUrl: '/akash.deployment.v1beta3.MsgCreateDeployment',
     value: {
       id: { owner, dseq },
+      groups: [],
       version: new Uint8Array(32), // SDL hash placeholder
       depositor: owner,
       deposit: { denom: 'uakt', amount: '5000000' },
@@ -301,35 +327,35 @@ function buildCreateDeploymentMsg(owner: string, dseq: string, _sdl: string) {
 
 function buildCreateLeaseMsg(
   owner: string,
-  dseq: string,
+  dseq: Long,
   provider: string,
-  gseq: string,
-  oseq: string,
+  gseq: number,
+  oseq: number,
 ) {
   return {
     typeUrl: '/akash.market.v1beta4.MsgCreateLease',
     value: {
-      bid_id: { owner, dseq, gseq, oseq, provider },
+      bidId: { owner, dseq, gseq, oseq, provider },
     },
   };
 }
 
 function buildCloseLeaseMsg(
   owner: string,
-  dseq: string,
+  dseq: Long,
   provider: string,
-  gseq: string,
-  oseq: string,
+  gseq: number,
+  oseq: number,
 ) {
   return {
     typeUrl: '/akash.market.v1beta4.MsgCloseLease',
     value: {
-      lease_id: { owner, dseq, gseq, oseq, provider },
+      leaseId: { owner, dseq, gseq, oseq, provider },
     },
   };
 }
 
-function buildCloseDeploymentMsg(owner: string, dseq: string) {
+function buildCloseDeploymentMsg(owner: string, dseq: Long) {
   return {
     typeUrl: '/akash.deployment.v1beta3.MsgCloseDeployment',
     value: {

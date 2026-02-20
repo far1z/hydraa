@@ -4,7 +4,7 @@
  * Uses cosmjs libraries to interact with the Akash chain.
  */
 
-import { DirectSecp256k1HdWallet } from '@cosmjs/proto-signing';
+import { DirectSecp256k1HdWallet, type Registry } from '@cosmjs/proto-signing';
 import {
   SigningStargateClient,
   type StdFee,
@@ -24,12 +24,14 @@ const HD_PATH = "m/44'/118'/0'/0/0";
 export class AkashWallet {
   private mnemonic: string;
   private rpcEndpoint: string;
+  private registry: Registry | undefined;
   private wallet: DirectSecp256k1HdWallet | null = null;
   private client: SigningStargateClient | null = null;
 
-  constructor(mnemonic: string, rpcEndpoint?: string) {
+  constructor(mnemonic: string, rpcEndpoint?: string, registry?: Registry) {
     this.mnemonic = mnemonic;
     this.rpcEndpoint = rpcEndpoint ?? DEFAULT_RPC;
+    this.registry = registry;
   }
 
   /** Lazily initialise the HD wallet from the stored mnemonic. */
@@ -47,13 +49,14 @@ export class AkashWallet {
     return this.wallet;
   }
 
-  /** Lazily create (or reuse) a signing Stargate client. */
+  /** Lazily create (or reuse) a signing Stargate client with Akash type registry. */
   private async getClient(): Promise<SigningStargateClient> {
     if (!this.client) {
       const wallet = await this.getWallet();
       this.client = await SigningStargateClient.connectWithSigner(
         this.rpcEndpoint,
         wallet,
+        this.registry ? { registry: this.registry } : undefined,
       );
     }
     return this.client;
