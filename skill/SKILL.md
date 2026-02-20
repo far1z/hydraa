@@ -8,11 +8,10 @@ metadata:
       bins: ["node"]
     optional_skills: ["everclaw"]
     install:
-      - id: npm
-        kind: npm
-        package: "hydraa"
-        bins: ["hydraa"]
-        label: "Install Hydraa"
+      - id: git
+        kind: shell
+        command: "mkdir -p ~/repos && cd ~/repos && git clone https://github.com/far1z/hydraa.git && cd hydraa && npm install && npm run build"
+        label: "Clone and build Hydraa from source"
 ---
 
 # Hydraa — Decentralize Your OpenClaw Agent
@@ -41,8 +40,10 @@ Tell your agent: "Deploy yourself to Akash and set up Nostr"
 
 Or use the CLI:
 ```bash
-npx hydraa init
-npx hydraa deploy
+# After cloning and building from source
+cd ~/repos/hydraa
+node dist/cli/src/index.js init
+node dist/cli/src/index.js deploy
 ```
 
 ## Available Tools
