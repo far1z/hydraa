@@ -4,7 +4,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
 import { bytesToHex } from "@noble/hashes/utils";
+import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
 import { banner, success, error, warn, info, createSpinner } from "../utils/display.js";
+
+/** Generate a 24-word BIP39 mnemonic using cosmjs */
+async function generateMnemonic(): Promise<string> {
+  // DirectSecp256k1HdWallet.generate creates a wallet with a random mnemonic
+  const wallet = await DirectSecp256k1HdWallet.generate(24, { prefix: "akash" });
+  return wallet.mnemonic;
+}
 
 function checkNodeVersion(): boolean {
   const major = parseInt(process.versions.node.split(".")[0], 10);
@@ -44,22 +52,48 @@ export const initCommand = new Command("init")
     success(`Workspace: ${workspace}`);
 
     // Generate Nostr keypair
-    const spinner = createSpinner("Generating Nostr keypair...");
-    spinner.start();
+    const nostrSpinner = createSpinner("Generating Nostr keypair...");
+    nostrSpinner.start();
 
     const sk = generateSecretKey();
     const pk = getPublicKey(sk);
     const npub = nip19.npubEncode(pk);
     const nsec = nip19.nsecEncode(sk);
 
-    spinner.succeed("Nostr keypair generated");
+    nostrSpinner.succeed("Nostr keypair generated");
 
     console.log();
-    info(`Your agent's public identity:`);
+    info("Your agent's Nostr identity:");
     console.log(`  npub: ${npub}`);
     console.log();
     warn("Save your nsec (secret key) securely. It will NOT be shown again.");
     console.log(`  nsec: ${nsec}`);
+    console.log();
+
+    // Generate AKT wallet
+    const aktSpinner = createSpinner("Generating AKT wallet...");
+    aktSpinner.start();
+
+    const mnemonic = await generateMnemonic();
+    const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, {
+      prefix: "akash",
+    });
+    const [account] = await wallet.getAccounts();
+    const walletAddress = account.address;
+
+    aktSpinner.succeed("AKT wallet generated");
+
+    console.log();
+    warn("Save your AKT wallet mnemonic securely. It will NOT be shown again.");
+    console.log();
+    console.log(`  Mnemonic: ${mnemonic}`);
+    console.log();
+    console.log(`  Wallet Address: ${walletAddress}`);
+    console.log();
+    info(`To deploy, send ~$5 worth of AKT tokens to:`);
+    console.log(`  ${walletAddress}`);
+    console.log();
+    info("I'll check the balance periodically and let you know when it's funded!");
     console.log();
 
     // Create config directory and template
@@ -81,8 +115,10 @@ nostr:
     - "wss://relay.nostr.band"
 
 akash:
-  # Wallet mnemonic for AKT payments (set via HYDRAA_AKT_MNEMONIC env var)
-  # mnemonic: ""
+  # Wallet mnemonic for AKT payments
+  mnemonic: "${mnemonic}"
+  # Wallet address (derived from mnemonic)
+  address: "${walletAddress}"
   # RPC endpoint
   rpc: "https://rpc.akashnet.net:443"
   # Chain ID
@@ -108,22 +144,14 @@ heartbeat:
       warn(`Config already exists: ${configPath}`);
     }
 
-    // Check for AKT wallet
-    const aktMnemonic = process.env["HYDRAA_AKT_MNEMONIC"];
-    if (!aktMnemonic) {
-      warn("No AKT wallet mnemonic found (HYDRAA_AKT_MNEMONIC)");
-      info("You'll need AKT tokens to deploy. See: hydraa fund");
-    } else {
-      success("AKT wallet mnemonic found");
-    }
-
     // Next steps
     console.log();
     console.log("  Next steps:");
     console.log("  ─────────────────────────────────────────────");
-    info("1. Fund your AKT wallet:          hydraa fund");
-    info("2. Deploy to Akash:               hydraa deploy");
-    info("3. Check status:                  hydraa status");
-    info("4. Chat with your agent:          hydraa chat");
+    info(`1. Fund your wallet:              Send AKT to ${walletAddress}`);
+    info("2. Check balance:                 hydraa fund");
+    info("3. Deploy to Akash:               hydraa deploy");
+    info("4. Check status:                  hydraa status");
+    info("5. Chat with your agent:          hydraa chat");
     console.log();
   });
