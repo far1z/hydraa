@@ -14,9 +14,22 @@ import { destroyCommand } from "./commands/destroy.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const pkg = JSON.parse(
-  readFileSync(join(__dirname, "..", "..", "package.json"), "utf-8"),
-);
+/** Walk up from current file to find the nearest package.json */
+function findPackageJson(): string {
+  let dir = __dirname;
+  for (let i = 0; i < 10; i++) {
+    const candidate = join(dir, "package.json");
+    try {
+      readFileSync(candidate);
+      return candidate;
+    } catch {
+      dir = dirname(dir);
+    }
+  }
+  throw new Error("Could not find package.json");
+}
+
+const pkg = JSON.parse(readFileSync(findPackageJson(), "utf-8"));
 
 const program = new Command();
 

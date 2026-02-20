@@ -8,7 +8,7 @@
     "hydraa": "dist/cli/src/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "npm install --include=dev && tsc && cp package.json dist/package.json && chmod +x dist/cli/src/index.js",
     "dev": "tsc --watch",
     "test": "vitest",
     "lint": "eslint skill/ cli/",
