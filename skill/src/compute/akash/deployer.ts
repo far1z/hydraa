@@ -30,21 +30,35 @@ import { generateSDL } from './sdl.js';
 
 /**
  * Load the Akash protobuf type registry so cosmjs can serialize Akash messages.
- * Side-effect imports of @akashnetwork/akash-api populate a global registry.
+ * Side-effect imports of @akashnetwork/akash-api populate a global messageTypeRegistry.
+ * We then register each type with a cosmjs Registry for proper encoding.
  */
-function loadAkashRegistry(): Registry {
+function loadAkashRegistry(): { registry: Registry; types: Map<string, any> } {
   const require = createRequire(import.meta.url);
   require('@akashnetwork/akash-api/v1beta3');
   require('@akashnetwork/akash-api/v1beta4');
-  const { getAkashTypeRegistry } = require('@akashnetwork/akashjs/build/stargate');
-  return new Registry([...defaultRegistryTypes, ...getAkashTypeRegistry()]);
+  const { messageTypeRegistry } = require('@akashnetwork/akash-api/typeRegistry');
+
+  const registry = new Registry(defaultRegistryTypes);
+  for (const [typeName, typeImpl] of messageTypeRegistry) {
+    registry.register(`/${typeName}`, typeImpl as any);
+  }
+  return { registry, types: messageTypeRegistry };
 }
 
-/** Cached registry instance. */
-let _registry: Registry | null = null;
+/** Cached instances. */
+let _loaded: { registry: Registry; types: Map<string, any> } | null = null;
+function getLoaded() {
+  if (!_loaded) _loaded = loadAkashRegistry();
+  return _loaded;
+}
 function getRegistry(): Registry {
-  if (!_registry) _registry = loadAkashRegistry();
-  return _registry;
+  return getLoaded().registry;
+}
+function getAkashType(name: string): any {
+  const type = getLoaded().types.get(name);
+  if (!type) throw new Error(`Unknown Akash type: ${name}`);
+  return type;
 }
 
 /** How long (ms) to wait for bids after creating a deployment. */
@@ -297,12 +311,8 @@ export class AkashProvider implements ComputeProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Message builders
+// Message builders — use fromPartial for proper protobuf encoding
 // ---------------------------------------------------------------------------
-// These produce Cosmos SDK `EncodeObject` values that cosmjs can sign.
-// The actual protobuf types come from @akashnetwork/akashjs, but we build
-// plain objects here so the module compiles even when the protobuf codegen
-// isn't fully wired.
 
 interface Bid {
   provider: string;
@@ -312,16 +322,19 @@ interface Bid {
   providerUri?: string;
 }
 
-function buildCreateDeploymentMsg(owner: string, dseq: Long, _sdl: string) {
+function buildCreateDeploymentMsg(owner: string, dseq: Long, sdl: string) {
+  const { sha256 } = require('@noble/hashes/sha256') as typeof import('@noble/hashes/sha256');
+  const version = sha256(new TextEncoder().encode(sdl));
+  const MsgCreateDeployment = getAkashType('akash.deployment.v1beta3.MsgCreateDeployment');
   return {
     typeUrl: '/akash.deployment.v1beta3.MsgCreateDeployment',
-    value: {
+    value: MsgCreateDeployment.fromPartial({
       id: { owner, dseq },
       groups: [],
-      version: new Uint8Array(32), // SDL hash placeholder
+      version,
       depositor: owner,
       deposit: { denom: 'uakt', amount: '5000000' },
-    },
+    }),
   };
 }
 
@@ -332,11 +345,12 @@ function buildCreateLeaseMsg(
   gseq: number,
   oseq: number,
 ) {
+  const MsgCreateLease = getAkashType('akash.market.v1beta4.MsgCreateLease');
   return {
     typeUrl: '/akash.market.v1beta4.MsgCreateLease',
-    value: {
+    value: MsgCreateLease.fromPartial({
       bidId: { owner, dseq, gseq, oseq, provider },
-    },
+    }),
   };
 }
 
@@ -347,27 +361,29 @@ function buildCloseLeaseMsg(
   gseq: number,
   oseq: number,
 ) {
+  const MsgCloseLease = getAkashType('akash.market.v1beta4.MsgCloseLease');
   return {
     typeUrl: '/akash.market.v1beta4.MsgCloseLease',
-    value: {
+    value: MsgCloseLease.fromPartial({
       leaseId: { owner, dseq, gseq, oseq, provider },
-    },
+    }),
   };
 }
 
 function buildCloseDeploymentMsg(owner: string, dseq: Long) {
+  const MsgCloseDeployment = getAkashType('akash.deployment.v1beta3.MsgCloseDeployment');
   return {
     typeUrl: '/akash.deployment.v1beta3.MsgCloseDeployment',
-    value: {
+    value: MsgCloseDeployment.fromPartial({
       id: { owner, dseq },
-    },
+    }),
   };
 }
 
 function defaultFee() {
   return {
-    amount: [{ denom: 'uakt', amount: '5000' }],
-    gas: '300000',
+    amount: [{ denom: 'uakt', amount: '20000' }],
+    gas: '800000',
   };
 }
 

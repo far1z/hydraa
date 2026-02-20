@@ -1,41 +1,39 @@
 import { Command } from "commander";
-import { createRequire } from "node:module";
-import { DirectSecp256k1HdWallet, Registry } from "@cosmjs/proto-signing";
-import { SigningStargateClient, StargateClient, defaultRegistryTypes } from "@cosmjs/stargate";
+import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
+import { SigningStargateClient, StargateClient } from "@cosmjs/stargate";
 import Long from "long";
+import { sha256 } from "@noble/hashes/sha256";
 import {
   requireConfig,
   saveConfig,
   DEFAULT_RPC,
   DEFAULT_CHAIN_ID,
 } from "../utils/config.js";
+import { getAkashRegistry, getAkashType } from "../utils/akash-registry.js";
 import { banner, success, error, warn, info, createSpinner, formatAKT } from "../utils/display.js";
-
-/**
- * Load the Akash protobuf type registry.
- *
- * The @akashnetwork/akash-api package uses side-effect imports — importing the
- * barrel modules populates a global messageTypeRegistry that getAkashTypeRegistry
- * then reads from. We use createRequire because the packages are CJS.
- */
-function loadAkashRegistry(): Registry {
-  const require = createRequire(import.meta.url);
-
-  // Side-effect imports: populates the shared messageTypeRegistry
-  require("@akashnetwork/akash-api/v1beta3");
-  require("@akashnetwork/akash-api/v1beta4");
-
-  const { getAkashTypeRegistry } = require("@akashnetwork/akashjs/build/stargate");
-  const akashTypes = getAkashTypeRegistry();
-
-  const registry = new Registry([...defaultRegistryTypes, ...akashTypes]);
-  return registry;
-}
 
 /** How long (ms) to wait for bids after creating a deployment. */
 const BID_TIMEOUT_MS = 120_000;
 /** Polling interval while waiting for bids. */
 const BID_POLL_MS = 5_000;
+
+/** Hash SDL content to produce the deployment version (32-byte sha256). */
+function hashSDL(sdl: string): Uint8Array {
+  return sha256(new TextEncoder().encode(sdl));
+}
+
+/** Parse memory string like "512Mi" to bytes. */
+function parseMemoryBytes(mem: string): number {
+  const match = mem.match(/^(\d+)(Ki|Mi|Gi)?$/);
+  if (!match) return 536870912;
+  const val = parseInt(match[1], 10);
+  switch (match[2]) {
+    case "Ki": return val * 1024;
+    case "Mi": return val * 1024 * 1024;
+    case "Gi": return val * 1024 * 1024 * 1024;
+    default: return val;
+  }
+}
 
 export const deployCommand = new Command("deploy")
   .description("Deploy your agent to decentralized compute")
@@ -64,15 +62,15 @@ export const deployCommand = new Command("deploy")
     }
 
     const rpc = config.akash?.rpc ?? DEFAULT_RPC;
-    const chainId = config.akash?.chain_id ?? DEFAULT_CHAIN_ID;
     const cpu = config.compute?.cpu ?? 0.5;
     const memory = config.compute?.memory ?? "512Mi";
     const storage = config.compute?.storage ?? "1Gi";
     const image = "ghcr.io/openclaw/hydraa-runtime:latest";
-
-    // Build SDL
     const nostrRelays = (config.nostr?.relays ?? ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]).join(",");
+
+    // Build SDL for manifest upload and version hash
     const sdl = buildSDL({ cpu, memory, storage, image, nostrRelays });
+    const sdlVersion = hashSDL(sdl);
 
     if (opts.dryRun) {
       info("Dry run — Akash SDL manifest:\n");
@@ -82,23 +80,22 @@ export const deployCommand = new Command("deploy")
 
     info(`Provider: ${opts.provider}`);
     info(`RPC:      ${rpc}`);
-    info(`Chain:    ${chainId}`);
     console.log();
 
-    // Step 0: Load Akash type registry
+    // Step 0: Load Akash protobuf types
     const regSpinner = createSpinner("Loading Akash protobuf types...");
     regSpinner.start();
-    let registry: Registry;
+    let registry;
     try {
-      registry = loadAkashRegistry();
-      regSpinner.succeed("Akash types loaded");
+      registry = getAkashRegistry();
+      regSpinner.succeed("Akash types registered");
     } catch (err) {
-      regSpinner.fail("Failed to load Akash type registry");
+      regSpinner.fail("Failed to load Akash types");
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
 
-    // Step 1: Load wallet and check balance
+    // Step 1: Load wallet
     const walletSpinner = createSpinner("Loading wallet...");
     walletSpinner.start();
 
@@ -136,15 +133,13 @@ export const deployCommand = new Command("deploy")
       balSpinner.warn("Could not check balance (RPC error). Proceeding anyway...");
     }
 
-    // Step 2: Create deployment transaction with Akash registry
+    // Step 2: Create deployment with proper protobuf encoding
     const deploySpinner = createSpinner("Creating Akash deployment...");
     deploySpinner.start();
 
     let signingClient: SigningStargateClient;
     try {
-      signingClient = await SigningStargateClient.connectWithSigner(rpc, wallet, {
-        registry,
-      });
+      signingClient = await SigningStargateClient.connectWithSigner(rpc, wallet, { registry });
     } catch (err) {
       deploySpinner.fail("Failed to connect to Akash RPC");
       error(err instanceof Error ? err.message : String(err));
@@ -152,44 +147,56 @@ export const deployCommand = new Command("deploy")
     }
 
     const dseq = Long.fromNumber(Date.now());
+    const cpuMilliunits = Math.round(cpu * 1000);
+    const memBytes = parseMemoryBytes(memory);
+    const storBytes = parseMemoryBytes(storage);
+
+    // Build message using protobuf fromPartial for correct encoding
+    const MsgCreateDeployment = getAkashType("akash.deployment.v1beta3.MsgCreateDeployment");
+    const deployMsgValue = MsgCreateDeployment.fromPartial({
+      id: { owner: address, dseq },
+      groups: [
+        {
+          name: "dcloud",
+          requirements: {
+            signedBy: { allOf: [], anyOf: [] },
+            attributes: [],
+          },
+          resources: [
+            {
+              resource: {
+                id: 1,
+                cpu: { units: { val: String(cpuMilliunits) }, attributes: [] },
+                memory: { quantity: { val: String(memBytes) }, attributes: [] },
+                storage: [{ name: "default", quantity: { val: String(storBytes) }, attributes: [] }],
+                gpu: { units: { val: "0" }, attributes: [] },
+                endpoints: [],
+              },
+              count: 1,
+              price: { denom: "uakt", amount: "10000" },
+            },
+          ],
+        },
+      ],
+      version: sdlVersion,
+      deposit: { denom: "uakt", amount: "5000000" },
+      depositor: address,
+    });
+
     const createMsg = {
       typeUrl: "/akash.deployment.v1beta3.MsgCreateDeployment",
-      value: {
-        id: { owner: address, dseq },
-        groups: [
-          {
-            name: "dcloud",
-            requirements: { signedBy: { allOf: [], anyOf: [] }, attributes: [] },
-            resources: [
-              {
-                resource: {
-                  id: 1,
-                  cpu: { units: { val: new Uint8Array(Buffer.from(String(cpu * 1000))) } },
-                  memory: { quantity: { val: new Uint8Array(Buffer.from(String(parseMemoryBytes(memory)))) } },
-                  storage: [{ name: "default", quantity: { val: new Uint8Array(Buffer.from(String(parseStorageBytes(storage)))) } }],
-                  gpu: { units: { val: new Uint8Array(Buffer.from("0")) } },
-                  endpoints: [],
-                },
-                count: 1,
-                price: { denom: "uakt", amount: "10000" },
-              },
-            ],
-          },
-        ],
-        version: new Uint8Array(32),
-        deposit: { denom: "uakt", amount: "5000000" },
-        depositor: address,
-      },
+      value: deployMsgValue,
+    };
+
+    const fee = {
+      amount: [{ denom: "uakt", amount: "20000" }],
+      gas: "800000",
     };
 
     let txHash: string;
     try {
       deploySpinner.text = "Submitting deployment transaction...";
-      const result = await signingClient.signAndBroadcast(
-        address,
-        [createMsg],
-        { amount: [{ denom: "uakt", amount: "5000" }], gas: "300000" },
-      );
+      const result = await signingClient.signAndBroadcast(address, [createMsg], fee, "Hydraa deployment");
 
       if (result.code !== 0) {
         throw new Error(`Tx failed (code ${result.code}): ${result.rawLog ?? "unknown"}`);
@@ -236,7 +243,7 @@ export const deployCommand = new Command("deploy")
 
         bidSpinner.text = `Waiting for provider bids... (${Math.round((deadline - Date.now()) / 1000)}s remaining)`;
       } catch {
-        // Retry on network errors
+        // Retry
       }
       await new Promise((r) => setTimeout(r, BID_POLL_MS));
     }
@@ -244,38 +251,36 @@ export const deployCommand = new Command("deploy")
     if (!bestBid) {
       bidSpinner.fail("No bids received within timeout");
       error("No providers bid on your deployment. This can happen if:");
-      info("  - Your SDL has configuration issues");
-      info("  - No providers are currently available in the region");
+      info("  - No providers are currently available");
       info("  - Your deposit is too low");
-      info("Try again or adjust your SDL with: hydraa deploy --dry-run");
+      info("Try again or check your SDL with: hydraa deploy --dry-run");
       signingClient.disconnect();
       process.exit(1);
     }
 
-    // Step 4: Create lease (accept bid) — use proper protobuf types
+    // Step 4: Create lease using proper protobuf encoding
     const leaseSpinner = createSpinner("Accepting best bid and creating lease...");
     leaseSpinner.start();
 
+    const MsgCreateLease = getAkashType("akash.market.v1beta4.MsgCreateLease");
+    const leaseMsgValue = MsgCreateLease.fromPartial({
+      bidId: {
+        owner: address,
+        dseq,
+        gseq: bestBid.gseq,
+        oseq: bestBid.oseq,
+        provider: bestBid.provider,
+      },
+    });
+
     const leaseMsg = {
       typeUrl: "/akash.market.v1beta4.MsgCreateLease",
-      value: {
-        bidId: {
-          owner: address,
-          dseq,
-          gseq: bestBid.gseq,
-          oseq: bestBid.oseq,
-          provider: bestBid.provider,
-        },
-      },
+      value: leaseMsgValue,
     };
 
     let leaseTxHash: string;
     try {
-      const result = await signingClient.signAndBroadcast(
-        address,
-        [leaseMsg],
-        { amount: [{ denom: "uakt", amount: "5000" }], gas: "300000" },
-      );
+      const result = await signingClient.signAndBroadcast(address, [leaseMsg], fee, "Accept bid");
       if (result.code !== 0) {
         throw new Error(`Lease tx failed (code ${result.code}): ${result.rawLog ?? "unknown"}`);
       }
@@ -292,7 +297,6 @@ export const deployCommand = new Command("deploy")
     const manifestSpinner = createSpinner("Sending manifest to provider...");
     manifestSpinner.start();
 
-    // Query provider info to get their URI
     let providerUri = "";
     try {
       const providerUrl = `${rpc}/akash/provider/v1beta3/providers/${bestBid.provider}`;
@@ -302,7 +306,7 @@ export const deployCommand = new Command("deploy")
         providerUri = provBody.provider?.host_uri ?? "";
       }
     } catch {
-      // Will try to send manifest anyway
+      // Continue
     }
 
     if (providerUri) {
@@ -315,20 +319,20 @@ export const deployCommand = new Command("deploy")
           signal: AbortSignal.timeout(15_000),
         });
         if (!manifestRes.ok) {
-          manifestSpinner.warn(`Manifest upload returned HTTP ${manifestRes.status}. Provider may still pull the image.`);
+          manifestSpinner.warn(`Manifest upload returned HTTP ${manifestRes.status}`);
         } else {
           manifestSpinner.succeed("Manifest sent to provider");
         }
       } catch {
-        manifestSpinner.warn("Could not reach provider API. Deployment may still start automatically.");
+        manifestSpinner.warn("Could not reach provider API.");
       }
     } else {
-      manifestSpinner.warn("Could not resolve provider URI. Manifest not sent (provider may pull from chain).");
+      manifestSpinner.warn("Could not resolve provider URI.");
     }
 
     signingClient.disconnect();
 
-    // Save deployment state to config
+    // Save state
     const dseqStr = dseq.toString();
     try {
       config._state = config._state ?? {};
@@ -344,7 +348,7 @@ export const deployCommand = new Command("deploy")
       };
       saveConfig(config);
     } catch {
-      warn("Could not save deployment state to config. Note your dseq for reference.");
+      warn("Could not save deployment state to config.");
     }
 
     // Summary
@@ -402,22 +406,4 @@ deployment:
       profile: agent
       count: 1
 `;
-}
-
-/** Parse memory string like "512Mi" to bytes. */
-function parseMemoryBytes(mem: string): number {
-  const match = mem.match(/^(\d+)(Mi|Gi|Ki)?$/);
-  if (!match) return 536870912; // 512Mi default
-  const val = parseInt(match[1], 10);
-  switch (match[2]) {
-    case "Ki": return val * 1024;
-    case "Mi": return val * 1024 * 1024;
-    case "Gi": return val * 1024 * 1024 * 1024;
-    default: return val;
-  }
-}
-
-/** Parse storage string like "1Gi" to bytes. */
-function parseStorageBytes(stor: string): number {
-  return parseMemoryBytes(stor);
 }
